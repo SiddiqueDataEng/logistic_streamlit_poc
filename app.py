@@ -493,12 +493,347 @@ def sql(query: str, _silent: bool = False) -> pd.DataFrame:
     if status != "SUCCEEDED":
         err = resp.get("status", {}).get("error", {}).get("message", "unknown error")
         if not _silent:
+            # TABLE_OR_VIEW_NOT_FOUND — suppress the red error, show softer info
+            if "TABLE_OR_VIEW_NOT_FOUND" in err or "42P01" in err:
+                # Extract table name from error message if possible
+                return pd.DataFrame()
             st.error(f"⚠️  Query failed: {err}")
         return pd.DataFrame()
 
     cols = [c["name"] for c in resp["manifest"]["schema"]["columns"]]
     rows = resp.get("result", {}).get("data_array", []) or []
     return pd.DataFrame(rows, columns=cols)
+
+
+def sql_or_empty(query: str, table_hint: str = "") -> tuple[pd.DataFrame, str]:
+    """Run a query — returns (DataFrame, error_type).
+    error_type: '' = ok, 'missing_table' = table doesn't exist yet, 'auth' = token issue, 'other' = other.
+    Never shows a Streamlit error — caller decides how to present the state.
+    """
+    active_token = st.session_state.get("active_token") or TOKEN
+    active_host  = st.session_state.get("active_host")  or HOST
+    active_wh    = st.session_state.get("active_wh")    or WH_ID
+
+    if not active_token:
+        return pd.DataFrame(), "auth"
+
+    headers = _make_headers(active_token)
+    payload = {"statement": query.strip(), "warehouse_id": active_wh,
+               "wait_timeout": "50s", "on_wait_timeout": "CONTINUE"}
+    try:
+        r = requests.post(f"{active_host}/api/2.0/sql/statements",
+                          headers=headers, json=payload, timeout=90)
+    except Exception:
+        return pd.DataFrame(), "other"
+
+    if r.status_code in (401, 403):
+        return pd.DataFrame(), "auth"
+    if not r.ok:
+        return pd.DataFrame(), "other"
+
+    resp    = r.json()
+    stmt_id = resp["statement_id"]
+    status  = resp.get("status", {}).get("state", "UNKNOWN")
+    deadline = time.time() + 120
+    while status in ("PENDING", "RUNNING") and time.time() < deadline:
+        time.sleep(2)
+        r2     = requests.get(f"{active_host}/api/2.0/sql/statements/{stmt_id}",
+                              headers=headers, timeout=30)
+        if not r2.ok:
+            return pd.DataFrame(), "other"
+        resp   = r2.json()
+        status = resp.get("status", {}).get("state", "UNKNOWN")
+
+    if status != "SUCCEEDED":
+        err = resp.get("status", {}).get("error", {}).get("message", "")
+        if "TABLE_OR_VIEW_NOT_FOUND" in err or "42P01" in err:
+            return pd.DataFrame(), "missing_table"
+        return pd.DataFrame(), "other"
+
+    cols = [c["name"] for c in resp["manifest"]["schema"]["columns"]]
+    rows = resp.get("result", {}).get("data_array", []) or []
+    return pd.DataFrame(rows, columns=cols), ""
+
+
+def _not_yet_built(notebook: str, table: str, extra: str = ""):
+    """Render a consistent 'table not built yet' info card."""
+    st.markdown(f"""
+    <div style="background:rgba(200,168,75,.06);border:1px solid rgba(200,168,75,.2);
+    border-radius:12px;padding:20px 24px;margin:12px 0;">
+    <div style="font-size:1rem;font-weight:700;color:#E8C96B;margin-bottom:8px;">
+    ⏳ Table not yet populated
+    </div>
+    <div style="font-size:.85rem;color:#94A3B8;line-height:1.7;">
+    <code style="color:#E8C96B;">{table}</code> doesn't exist in your Databricks catalog yet.<br>
+    <strong style="color:white;">To populate it:</strong> Run notebook
+    <code style="color:#00B4D8;">{notebook}</code> in your Databricks workspace.
+    {('<br><span style="color:#94A3B8;">' + extra + '</span>') if extra else ''}
+    </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ── Demo data — shown when Databricks tables don't exist yet ────────────────────
+import random as _rnd
+from datetime import datetime as _dt, timedelta as _td
+
+_HUBS     = ["HUB-RUH","HUB-JED","HUB-DMM","HUB-MKK","HUB-MED"]
+_SVCS     = ["NQL-DOM-EXPRESS","NQL-DOM-STANDARD","NQL-DOM-ECONOMY","NQL-INTL-EXPRESS","NQL-BULK"]
+_CITIES   = ["Riyadh","Jeddah","Dammam","Mecca","Medina","Khobar","Tabuk","Abha"]
+_VCODES   = ["RUH","JED","DMM","MKK","MED","KHB","TBK","AHB"]
+_VEHTYPES = ["Light_Van","Medium_Truck","Heavy_Truck","Motorcycle","Refrigerated_Truck"]
+_STATUS   = ["PENDING","IN_TRANSIT","AT_HUB","OUT_FOR_DELIVERY","DELIVERED","FAILED_DELIVERY"]
+
+def _demo_banner():
+    st.markdown(
+        '<div style="background:rgba(0,180,216,.08);border:1px solid rgba(0,180,216,.25);'
+        'border-radius:8px;padding:8px 14px;margin-bottom:14px;font-size:.78rem;color:#7dd3fc;">'
+        '📊 <strong>Demo Mode</strong> — showing synthetic sample data. '
+        'Connect Databricks and run the pipeline notebooks to see live data.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+@st.cache_data(ttl=3600)
+def demo_shipment_kpis(days: int = 30) -> pd.DataFrame:
+    _rnd.seed(42)
+    rows = []
+    base = _dt.now() - _td(days=days)
+    for d in range(days):
+        dt = (base + _td(days=d)).date()
+        for hub in _HUBS:
+            for svc in _SVCS[:3]:
+                shp = _rnd.randint(50, 400)
+                rev = round(shp * _rnd.uniform(280, 520), 0)
+                sla = round(_rnd.uniform(78, 97), 1)
+                hrs = round(_rnd.uniform(14, 48), 1)
+                fail= round(_rnd.uniform(2, 12), 2)
+                rows.append({"created_date": str(dt), "hub_code": hub,
+                             "service_code": svc, "route_type": "DOMESTIC",
+                             "shipment_type": "B2C",
+                             "total_shipments": shp, "total_revenue_sar": rev,
+                             "sla_compliance_rate_pct": sla, "avg_delivery_hrs": hrs,
+                             "first_attempt_failure_rate_pct": fail,
+                             "delivered_count": int(shp * 0.88),
+                             "failed_delivery_count": int(shp * fail / 100),
+                             "returned_count": int(shp * 0.04),
+                             "customs_hold_count": int(shp * 0.01),
+                             "total_cod_sar": round(rev * 0.32, 0),
+                             "sla_met_count": int(shp * sla / 100)})
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600)
+def demo_shipments(n: int = 500) -> pd.DataFrame:
+    _rnd.seed(7)
+    rows = []
+    for i in range(n):
+        base_c = round(_rnd.uniform(15, 2500), 2)
+        hub  = _rnd.choice(_HUBS)
+        svc  = _rnd.choice(_SVCS)
+        hrs  = round(_rnd.uniform(4, 120), 1)
+        sla_t = 24 if "EXPRESS" in svc else 72
+        rows.append({
+            "waybill_number":  f"NQL{_rnd.randint(10**9, 10**10-1)}",
+            "customer_account": f"NACC-{_rnd.randint(10000,99999)}",
+            "service_code":    svc,
+            "shipment_type":   _rnd.choice(["B2B","B2C","B2C","C2C"]),
+            "route_type":      _rnd.choice(["DOMESTIC","DOMESTIC","INTERNATIONAL"]),
+            "hub_code":        hub,
+            "courier_id":      f"DRV-{_rnd.randint(1000,9999)}",
+            "status":          _rnd.choices(_STATUS, weights=[3,12,10,15,50,10])[0],
+            "attempt_count":   _rnd.choices([1,2,3,4], weights=[70,18,8,4])[0],
+            "weight_kg":       round(_rnd.uniform(0.2, 50), 2),
+            "chargeable_weight_kg": round(_rnd.uniform(0.2, 55), 2),
+            "total_charge_sar": round(base_c * 1.15, 2),
+            "base_charge_sar": base_c,
+            "vat_15pct_sar":   round(base_c * 0.15, 2),
+            "cod_amount_sar":  round(_rnd.uniform(50, 5000), 2) if _rnd.random() < 0.3 else None,
+            "is_cod":          _rnd.random() < 0.3,
+            "is_international": _rnd.random() < 0.15,
+            "requires_customs": _rnd.random() < 0.1,
+            "delivery_duration_hrs": hrs,
+            "sla_met":         hrs <= sla_t,
+            "origin_city":     _rnd.choice(_CITIES),
+            "dest_city":       _rnd.choice(_CITIES),
+            "origin_code":     _rnd.choice(_VCODES),
+            "dest_code":       _rnd.choice(_VCODES),
+            "origin_country":  "SA",
+            "dest_country":    _rnd.choice(["SA","SA","SA","AE","KW","QA"]),
+            "created_at":      str(_dt.now() - _td(days=_rnd.randint(0,90))),
+            "created_date":    str((_dt.now() - _td(days=_rnd.randint(0,90))).date()),
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600)
+def demo_fleet(n: int = 200) -> pd.DataFrame:
+    _rnd.seed(13)
+    rows = []
+    for _ in range(n):
+        score = _rnd.randint(45, 100)
+        rows.append({
+            "vehicle_id":       f"VHC-{_rnd.randint(1000,5999)}",
+            "vehicle_type":     _rnd.choice(_VEHTYPES),
+            "hub_code":         _rnd.choice(_HUBS),
+            "driver_id":        f"DRV-{_rnd.randint(1000,9999)}",
+            "safety_score":     score,
+            "avg_speed_kmh":    round(_rnd.uniform(30, 120), 1),
+            "overspeeds":       _rnd.randint(0, 20),
+            "brakes":           _rnd.randint(0, 15),
+            "accels":           _rnd.randint(0, 10),
+            "geofences":        _rnd.randint(0, 5),
+            "overheats":        _rnd.randint(0, 3),
+            "fuel_l":           round(_rnd.uniform(10, 200), 1),
+            "active_days":      _rnd.randint(5, 30),
+            "reading_date":     str((_dt.now() - _td(days=_rnd.randint(0,7))).date()),
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600)
+def demo_hub_kpis() -> pd.DataFrame:
+    _rnd.seed(99)
+    rows = []
+    for hub in _HUBS:
+        shp = _rnd.randint(8000, 45000)
+        rev = round(shp * _rnd.uniform(350, 500), 0)
+        sla = round(_rnd.uniform(80, 96), 1)
+        hrs = round(_rnd.uniform(16, 36), 1)
+        rr  = _HUBS.index(hub) + 1
+        sr  = sorted(_HUBS, key=lambda x: _rnd.random()).index(hub) + 1
+        rows.append({
+            "hub_code": hub, "shp_30d": shp, "rev_30d": rev,
+            "avg_sla": sla, "avg_hrs": hrs, "active_days": _rnd.randint(25, 30),
+            "revenue_rank": rr, "sla_rank": sr, "composite_rank": rr + sr,
+            "tier": "STAR" if rr <= 1 and sr <= 1 else
+                    ("HIGH VOLUME" if rr <= 2 else
+                     ("HIGH QUALITY" if sr <= 2 else "STANDARD")),
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600)
+def demo_routes() -> pd.DataFrame:
+    _rnd.seed(21)
+    rows = []
+    for _ in range(40):
+        oc = _rnd.choice(_VCODES); dc = _rnd.choice(_VCODES)
+        svc = _rnd.choice(_SVCS)
+        cnt = _rnd.randint(20, 400)
+        rows.append({
+            "route_code":     f"{oc}-{dc}", "origin_city": _CITIES[_VCODES.index(oc)] if oc in _VCODES else oc,
+            "dest_city":      _CITIES[_VCODES.index(dc)] if dc in _VCODES else dc,
+            "service_code":   svc, "shipment_count": cnt,
+            "avg_transit_hrs": round(_rnd.uniform(8, 72), 1),
+            "on_time_pct":    round(_rnd.uniform(72, 98), 1),
+            "rev":            round(cnt * _rnd.uniform(300, 500), 0),
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600)
+def demo_churn(n: int = 300) -> pd.DataFrame:
+    _rnd.seed(55)
+    rows = []
+    for _ in range(n):
+        rec = _rnd.randint(1, 180)
+        p   = min(99, max(1, round(rec * 0.4 + _rnd.uniform(-10, 10), 1)))
+        rows.append({
+            "customer_account":      f"NACC-{_rnd.randint(10000,99999)}",
+            "churn_probability_pct": p,
+            "churn_risk_band":       "HIGH" if p > 70 else ("MEDIUM" if p > 40 else "LOW"),
+            "recency_days":          rec,
+            "frequency":             _rnd.randint(1, 200),
+            "monetary_sar":          round(_rnd.uniform(500, 80000), 0),
+            "orders_last_30d":       _rnd.randint(0, 20),
+            "orders_last_90d":       _rnd.randint(0, 50),
+            "sla_satisfaction_pct":  round(_rnd.uniform(50, 99), 1),
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600)
+def demo_pagerank() -> pd.DataFrame:
+    _rnd.seed(77)
+    rows = []
+    for i, hub in enumerate(_HUBS):
+        vol = _rnd.randint(5000, 40000)
+        rows.append({
+            "id": hub, "pagerank_score": round(_rnd.uniform(0.05, 0.45), 6),
+            "outbound_volume": vol, "inbound_volume": int(vol * _rnd.uniform(0.8, 1.2)),
+            "total_volume": vol * 2, "dest_count": _rnd.randint(3, 12),
+            "origin_count": _rnd.randint(3, 12), "hub_rank": i + 1,
+            "hub_type": "MAJOR_HUB" if i < 2 else "LOCAL_HUB",
+            "hub_tier": ["TIER_1_GATEWAY","TIER_1_GATEWAY","TIER_2_REGIONAL",
+                          "TIER_2_REGIONAL","TIER_3_LOCAL"][i],
+        })
+    return pd.DataFrame(rows).sort_values("pagerank_score", ascending=False).reset_index(drop=True)
+
+@st.cache_data(ttl=3600)
+def demo_network_kpis() -> pd.DataFrame:
+    return pd.DataFrame([
+        ("total_cities",          15.0, "Network scale"),
+        ("total_routes",          42.0, "Directed edges"),
+        ("total_triangles",        8.0, "Network resilience"),
+        ("largest_scc_cities",    12.0, "Bidirectional coverage"),
+        ("avg_route_on_time_pct", 87.2, "SLA performance"),
+        ("bottleneck_routes",      3.0, "High risk routes"),
+        ("missing_return_routes",  6.0, "One-way flows"),
+        ("community_count",        4.0, "Logistics clusters"),
+    ], columns=["metric_name", "value", "description"])
+
+@st.cache_data(ttl=3600)
+def demo_ml_scores(n: int = 400) -> pd.DataFrame:
+    _rnd.seed(33)
+    rows = []
+    for _ in range(n):
+        p = round(_rnd.betavariate(2, 5) * 100, 2)
+        rows.append({
+            "waybill_number":  f"NQL{_rnd.randint(10**9, 10**10-1)}",
+            "customer_account": f"NACC-{_rnd.randint(10000,99999)}",
+            "service_code":    _rnd.choice(_SVCS),
+            "hub_code":        _rnd.choice(_HUBS),
+            "delay_risk_pct":  p,
+            "risk_band":       "HIGH" if p > 70 else ("MEDIUM" if p > 40 else "LOW"),
+            "model_version":   "GBTClassifier_v2",
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600)
+def demo_anomalies_fleet(n: int = 100) -> pd.DataFrame:
+    _rnd.seed(44)
+    rows = []
+    for _ in range(n):
+        rows.append({
+            "vehicle_id":     f"VHC-{_rnd.randint(1000,5999)}",
+            "reading_date":   str((_dt.now() - _td(days=_rnd.randint(0,30))).date()),
+            "avg_speed_kmh":  round(_rnd.uniform(80, 160), 1),
+            "total_fuel_l":   round(_rnd.uniform(50, 400), 1),
+            "overspeed_events": _rnd.randint(3, 25),
+            "harsh_brake_events": _rnd.randint(2, 15),
+            "safety_score":   _rnd.randint(30, 70),
+            "anomaly_score":  round(_rnd.uniform(-0.6, -0.05), 4),
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600)
+def demo_streaming_kpis(n: int = 60) -> pd.DataFrame:
+    _rnd.seed(88)
+    rows = []
+    base = _dt.now() - _td(minutes=n * 5)
+    for i in range(n):
+        ts = base + _td(minutes=i * 5)
+        for hub in _HUBS[:3]:
+            breach = round(_rnd.uniform(3, 25), 2)
+            rows.append({
+                "window_start": str(ts),
+                "hub_code": hub,
+                "service_code": _rnd.choice(_SVCS[:2]),
+                "shipments_in_window": _rnd.randint(10, 80),
+                "sla_breaches": _rnd.randint(0, 8),
+                "sla_breach_rate_pct": breach,
+                "revenue_in_window": round(_rnd.uniform(5000, 40000), 0),
+                "avg_transit_hrs": round(_rnd.uniform(12, 48), 1),
+                "delivery_rate_pct": round(_rnd.uniform(78, 97), 1),
+                "cod_count": _rnd.randint(2, 15),
+                "alert_flag": breach > 15,
+            })
+    return pd.DataFrame(rows)
 
 
 # ── Utilities ───────────────────────────────────────────────────────────────────
@@ -1651,6 +1986,9 @@ elif page == "🔍  Hub Performance":
                     WHEN sr<=2           THEN 'HIGH QUALITY'
                     ELSE 'STANDARD' END AS tier
         FROM ranked ORDER BY composite_rank""")
+    if hubs.empty:
+        _demo_banner()
+        hubs = demo_hub_kpis()
     if not hubs.empty:
         hubs = tonums(hubs, ["shp_30d","rev_30d","avg_sla","avg_hrs","active_days",
                                "revenue_rank","sla_rank","composite_rank"])
@@ -1723,9 +2061,10 @@ elif page == "🔍  Hub Performance":
 elif page == "🤖  ML Risk":
     hero("🤖", "ML Delay Risk Scores", "Random Forest SLA predictor · Active shipments · Risk bands")
 
-    scores = sql(f"SELECT * FROM {NS}.ml_sla_risk_scores ORDER BY delay_risk_pct DESC LIMIT 1000")
-    if scores.empty:
-        st.warning("No scores found. Run `09b-Naqel-ML-Anomaly.py` first.")
+    scores, _err_scores = sql_or_empty(f"SELECT * FROM {NS}.ml_sla_risk_scores ORDER BY delay_risk_pct DESC LIMIT 1000")
+    if _err_scores == "missing_table" or scores.empty:
+        _demo_banner()
+        scores = demo_ml_scores()
     else:
         scores = tonums(scores, ["delay_risk_pct"])
         bc = scores["risk_band"].value_counts()
@@ -1793,7 +2132,8 @@ elif page == "⚠️  Anomalies":
                      FROM {NS}.anomaly_fleet_telemetry
                      ORDER BY anomaly_score ASC LIMIT 200""")
         if fa.empty:
-            st.warning("No fleet anomalies. Run `09b-Naqel-ML-Anomaly.py` first.")
+            _demo_banner()
+            fa = demo_anomalies_fleet()
         else:
             fa = tonums(fa, ["avg_speed_kmh","total_fuel_l","overspeed_events",
                               "harsh_brake_events","safety_score","anomaly_score"])
@@ -1837,7 +2177,21 @@ elif page == "⚠️  Anomalies":
                      FROM {NS}.anomaly_freight_jobs
                      ORDER BY anomaly_score ASC LIMIT 200""")
         if fr.empty:
-            st.warning("No freight anomalies. Run `09b-Naqel-ML-Anomaly.py` first.")
+            _demo_banner()
+            # Generate demo freight anomalies from shipments data
+            import numpy as _np
+            _rnd2 = __import__("random")
+            _rnd2.seed(66)
+            fr = pd.DataFrame([{
+                "freight_job_id": f"FRT-{_rnd2.randint(10**6,10**7-1):08d}",
+                "mode": _rnd2.choice(["AIR","SEA","GROUND"]),
+                "origin_country": _rnd2.choice(["SA","AE","DE","CN","IN"]),
+                "dest_country":   _rnd2.choice(["SA","AE","GB","US"]),
+                "freight_cost_usd": round(_rnd2.uniform(200, 25000), 2),
+                "gross_weight_kg":  round(_rnd2.uniform(10, 5000), 1),
+                "transit_days":     _rnd2.randint(1, 30),
+                "anomaly_score":    round(_rnd2.uniform(-0.6, -0.05), 4),
+            } for _ in range(80)])
         else:
             fr = tonums(fr, ["freight_cost_usd","gross_weight_kg","transit_days","anomaly_score"])
             kpi_row([
@@ -2046,7 +2400,7 @@ elif page == "🔮  Churn & Demand":
     tab1, tab2, tab3 = st.tabs(["  Customer Churn  ", "  Demand Forecast  ", "  Freight Cost ML  "])
 
     with tab1:
-        churn = sql(f"""
+        churn, _e = sql_or_empty(f"""
             SELECT customer_account, churn_probability_pct, churn_risk_band,
                    recency_days, frequency, monetary_sar,
                    orders_last_30d, orders_last_90d, sla_satisfaction_pct,
@@ -2055,8 +2409,9 @@ elif page == "🔮  Churn & Demand":
             ORDER BY churn_probability_pct DESC
             LIMIT 1000
         """)
-        if churn.empty:
-            st.warning("No churn scores found. Run `11-Naqel-MLlib-Advanced.py` first.")
+        if _e == "missing_table" or churn.empty:
+            _demo_banner()
+            churn = demo_churn()
         else:
             churn = tonums(churn, ["churn_probability_pct", "recency_days", "frequency",
                                     "monetary_sar", "orders_last_30d", "orders_last_90d",
@@ -2080,7 +2435,6 @@ elif page == "🔮  Churn & Demand":
                                   color="churn_risk_band", size="frequency",
                                   hover_data=["customer_account", "sla_satisfaction_pct"])
                 st.plotly_chart(fig, use_container_width=True)
-
             section("High-Risk Accounts — Immediate Action Required")
             high_risk = churn[churn["churn_risk_band"] == "HIGH"].sort_values("churn_probability_pct", ascending=False)
             st.dataframe(
@@ -2090,7 +2444,7 @@ elif page == "🔮  Churn & Demand":
             dl(high_risk, "high_churn_risk")
 
     with tab2:
-        demand = sql(f"""
+        demand, _e = sql_or_empty(f"""
             SELECT created_date, hub_code, service_code,
                    demand AS actual_demand,
                    predicted_demand, demand_delta_pct, forecast_generated_at
@@ -2098,8 +2452,17 @@ elif page == "🔮  Churn & Demand":
             ORDER BY created_date DESC, hub_code
             LIMIT 500
         """)
-        if demand.empty:
-            st.warning("No demand forecast found. Run `11-Naqel-MLlib-Advanced.py` first.")
+        if _e == "missing_table" or demand.empty:
+            _demo_banner()
+            import random as _rd; _rd.seed(11)
+            from datetime import datetime as _dt2, timedelta as _td2
+            demand = pd.DataFrame([{
+                "created_date": str((_dt2.now()-_td2(days=i)).date()),
+                "hub_code": h, "service_code": "NQL-DOM-EXPRESS",
+                "actual_demand": _rd.randint(50,300),
+                "predicted_demand": _rd.randint(45,310),
+                "demand_delta_pct": round(_rd.uniform(-15,15),2),
+            } for i in range(30) for h in ["HUB-RUH","HUB-JED","HUB-DMM"]])
         else:
             demand = tonums(demand, ["actual_demand", "predicted_demand", "demand_delta_pct"])
             section("Actual vs Predicted Demand by Hub")
@@ -2109,15 +2472,13 @@ elif page == "🔮  Churn & Demand":
             for hub in top_hubs:
                 h = filt[filt["hub_code"] == hub].sort_values("created_date")
                 fig.add_scatter(x=h["created_date"], y=h["actual_demand"],
-                                name=f"{hub} actual", mode="lines",
-                                line=dict(width=2))
+                                name=f"{hub} actual", mode="lines", line=dict(width=2))
                 fig.add_scatter(x=h["created_date"], y=h["predicted_demand"],
                                 name=f"{hub} forecast", mode="lines",
                                 line=dict(width=2, dash="dash"))
             fig.update_layout(height=400, **CHART_BASE,
                                legend=dict(orientation="h", y=-0.25, bgcolor="rgba(0,0,0,0)"))
             st.plotly_chart(fig, use_container_width=True)
-
             section("Forecast Accuracy — Delta Distribution")
             fig = px.histogram(demand, x="demand_delta_pct", nbins=30,
                                color_discrete_sequence=[C_BLUE])
@@ -2126,15 +2487,23 @@ elif page == "🔮  Churn & Demand":
             dl(demand, "demand_forecast")
 
     with tab3:
-        frt_ml = sql(f"""
+        frt_ml, _e = sql_or_empty(f"""
             SELECT f.freight_job_id, actual_cost_usd, predicted_cost_usd,
                    cost_error_pct, cost_flag, scored_at
             FROM {NS}.ml_freight_cost_estimates f
             ORDER BY cost_error_pct DESC
             LIMIT 500
         """)
-        if frt_ml.empty:
-            st.warning("No freight cost estimates found. Run `11-Naqel-MLlib-Advanced.py` first.")
+        if _e == "missing_table" or frt_ml.empty:
+            _demo_banner()
+            import random as _rd3; _rd3.seed(22)
+            frt_ml = pd.DataFrame([{
+                "freight_job_id": f"FRT-{i:08d}",
+                "actual_cost_usd": round(_rd3.uniform(500,15000),2),
+                "predicted_cost_usd": round(_rd3.uniform(480,15500),2),
+                "cost_error_pct": round(abs(_rd3.gauss(8,6)),2),
+                "cost_flag": "ANOMALY" if _rd3.random()<0.1 else "NORMAL",
+            } for i in range(200)])
         else:
             frt_ml = tonums(frt_ml, ["actual_cost_usd", "predicted_cost_usd", "cost_error_pct"])
             kpi_row([
@@ -2174,9 +2543,10 @@ elif page == "🕸️  Network Graph":
     ])
 
     with tab1:
-        pr = sql(f"SELECT * FROM {NS}.gold_hub_pagerank ORDER BY hub_rank")
-        if pr.empty:
-            st.warning("No PageRank data. Run `12-Naqel-GraphX-Network.py` first.")
+        pr, _e_pr = sql_or_empty(f"SELECT * FROM {NS}.gold_hub_pagerank ORDER BY hub_rank")
+        if _e_pr == "missing_table" or pr.empty:
+            _demo_banner()
+            pr = demo_pagerank()
         else:
             pr = tonums(pr, ["pagerank_score", "outbound_volume", "inbound_volume",
                               "total_volume", "dest_count", "origin_count", "hub_rank"])
@@ -2230,7 +2600,16 @@ elif page == "🕸️  Network Graph":
             ORDER BY cluster_id, hub_rank
         """)
         if comm.empty:
-            st.warning("No community data. Run `12-Naqel-GraphX-Network.py` first.")
+            _demo_banner()
+            import random as _rd4; _rd4.seed(55)
+            comm = pd.DataFrame([{
+                "id": h, "cluster_id": (i%3)+1,
+                "cluster_name": f"CLUSTER_{(i%3)+1}",
+                "hub_rank": i+1, "hub_tier": ["TIER_1_GATEWAY","TIER_2_REGIONAL","TIER_3_LOCAL","TIER_3_LOCAL","TIER_4_SPOKE"][i],
+                "pagerank_score": round(_rd4.uniform(0.05,0.45),6),
+                "triangle_count": _rd4.randint(1,8),
+                "resilience_score": round(_rd4.uniform(3,9),2),
+            } for i,h in enumerate(["HUB-RUH","HUB-JED","HUB-DMM","HUB-MKK","HUB-MED"])])
         else:
             comm = tonums(comm, ["cluster_id", "hub_rank", "pagerank_score",
                                   "triangle_count", "resilience_score"])
@@ -2256,7 +2635,7 @@ elif page == "🕸️  Network Graph":
             dl(comm, "network_communities")
 
     with tab3:
-        rm = sql(f"""
+        rm, _e_rm = sql_or_empty(f"""
             SELECT origin_city, dest_city, total_volume, total_revenue_sar,
                    avg_transit_hrs, on_time_rate_pct, avg_attempts,
                    has_return_route, flow_imbalance_ratio, is_bottleneck,
@@ -2266,8 +2645,26 @@ elif page == "🕸️  Network Graph":
             ORDER BY total_volume DESC
             LIMIT 200
         """)
-        if rm.empty:
-            st.warning("No route graph data. Run `12-Naqel-GraphX-Network.py` first.")
+        if _e_rm == "missing_table" or rm.empty:
+            _demo_banner()
+            import random as _rd5; _rd5.seed(33)
+            _cities = ["Riyadh","Jeddah","Dammam","Mecca","Medina"]
+            rm = pd.DataFrame([{
+                "origin_city": _rd5.choice(_cities), "dest_city": _rd5.choice(_cities),
+                "total_volume": _rd5.randint(50,400),
+                "total_revenue_sar": round(_rd5.uniform(20000,200000),0),
+                "avg_transit_hrs": round(_rd5.uniform(8,72),1),
+                "on_time_rate_pct": round(_rd5.uniform(65,98),1),
+                "avg_attempts": round(_rd5.uniform(1,2.5),2),
+                "has_return_route": _rd5.random()>0.2,
+                "flow_imbalance_ratio": round(_rd5.uniform(0.5,3),2),
+                "is_bottleneck": _rd5.random()<0.15,
+                "volume_rank": _rd5.randint(1,30),
+                "efficiency_rank": _rd5.randint(1,30),
+                "origin_cluster": f"CLUSTER_{_rd5.randint(1,3)}",
+                "dest_cluster": f"CLUSTER_{_rd5.randint(1,3)}",
+                "is_cross_cluster": _rd5.random()>0.5,
+            } for _ in range(40)])
         else:
             rm = tonums(rm, ["total_volume", "total_revenue_sar", "avg_transit_hrs",
                               "on_time_rate_pct", "flow_imbalance_ratio", "volume_rank"])
@@ -2318,9 +2715,10 @@ elif page == "🕸️  Network Graph":
             dl(rm, "route_graph_metrics")
 
     with tab4:
-        kpis = sql(f"SELECT metric_name, value, description FROM {NS}.gold_network_kpis ORDER BY metric_name")
-        if kpis.empty:
-            st.warning("No network KPIs. Run `12-Naqel-GraphX-Network.py` first.")
+        kpis, _e_kpis = sql_or_empty(f"SELECT metric_name, value, description FROM {NS}.gold_network_kpis ORDER BY metric_name")
+        if _e_kpis == "missing_table" or kpis.empty:
+            _demo_banner()
+            kpis = demo_network_kpis()
         else:
             kpis = tonums(kpis, ["value"])
             section("Network Health KPIs")
@@ -2359,7 +2757,7 @@ elif page == "⚡  Live Streams":
     ])
 
     with tab1:
-        sla_s = sql(f"""
+        sla_s, _e_sla = sql_or_empty(f"""
             SELECT waybill_number, hub_code, courier_id, service_code,
                    sla_breach_severity, delivery_duration_hrs, sla_threshold_hrs,
                    total_charge_sar, event_time, _ingest_ts
@@ -2367,8 +2765,22 @@ elif page == "⚡  Live Streams":
             ORDER BY _ingest_ts DESC
             LIMIT 200
         """)
-        if sla_s.empty:
-            st.info("No streaming SLA alerts yet. Start the Structured Streaming notebook (13) to populate this table.")
+        if _e_sla == "missing_table" or sla_s.empty:
+            _demo_banner()
+            import random as _rd6; _rd6.seed(1)
+            from datetime import datetime as _dt6, timedelta as _td6
+            sla_s = pd.DataFrame([{
+                "waybill_number": f"NQL{_rd6.randint(10**9,10**10-1)}",
+                "hub_code": _rd6.choice(["HUB-RUH","HUB-JED","HUB-DMM"]),
+                "courier_id": f"DRV-{_rd6.randint(1000,9999)}",
+                "service_code": _rd6.choice(["NQL-DOM-EXPRESS","NQL-DOM-STANDARD"]),
+                "sla_breach_severity": _rd6.choices(["CRITICAL","HIGH","MEDIUM"],weights=[15,35,50])[0],
+                "delivery_duration_hrs": round(_rd6.uniform(25,120),1),
+                "sla_threshold_hrs": 24,
+                "total_charge_sar": round(_rd6.uniform(50,2000),2),
+                "event_time": str(_dt6.now()-_td6(minutes=_rd6.randint(0,120))),
+                "_ingest_ts": str(_dt6.now()-_td6(seconds=_rd6.randint(0,300))),
+            } for _ in range(50)])
         else:
             sla_s = tonums(sla_s, ["delivery_duration_hrs", "sla_threshold_hrs", "total_charge_sar"])
             sev_counts = sla_s["sla_breach_severity"].value_counts()
@@ -2398,7 +2810,7 @@ elif page == "⚡  Live Streams":
             dl(sla_s, "stream_sla_alerts")
 
     with tab2:
-        fleet_s = sql(f"""
+        fleet_s, _e_fs = sql_or_empty(f"""
             SELECT vehicle_id, driver_id, hub_code, window_start, window_end,
                    safety_score, alert_level, overspeed_events, harsh_brakes,
                    geofence_violations, overheat_events, avg_speed_kmh, fuel_consumed_l
@@ -2406,8 +2818,25 @@ elif page == "⚡  Live Streams":
             ORDER BY window_start DESC
             LIMIT 200
         """)
-        if fleet_s.empty:
-            st.info("No streaming fleet alerts yet. Start the Structured Streaming notebook (13) to populate.")
+        if _e_fs == "missing_table" or fleet_s.empty:
+            _demo_banner()
+            import random as _rd7; _rd7.seed(2)
+            from datetime import datetime as _dt7, timedelta as _td7
+            fleet_s = pd.DataFrame([{
+                "vehicle_id": f"VHC-{_rd7.randint(1000,5999)}",
+                "driver_id": f"DRV-{_rd7.randint(1000,9999)}",
+                "hub_code": _rd7.choice(["HUB-RUH","HUB-JED","HUB-DMM"]),
+                "window_start": str(_dt7.now()-_td7(minutes=_rd7.randint(0,60))),
+                "window_end": str(_dt7.now()-_td7(minutes=_rd7.randint(0,55))),
+                "safety_score": _rd7.randint(40,74),
+                "alert_level": _rd7.choices(["CRITICAL","WARNING"],weights=[30,70])[0],
+                "overspeed_events": _rd7.randint(1,8),
+                "harsh_brakes": _rd7.randint(0,5),
+                "geofence_violations": _rd7.randint(0,3),
+                "overheat_events": _rd7.randint(0,2),
+                "avg_speed_kmh": round(_rd7.uniform(80,140),1),
+                "fuel_consumed_l": round(_rd7.uniform(5,30),1),
+            } for _ in range(40)])
         else:
             fleet_s = tonums(fleet_s, ["safety_score", "overspeed_events", "harsh_brakes",
                                         "geofence_violations", "avg_speed_kmh", "fuel_consumed_l"])
@@ -2434,7 +2863,7 @@ elif page == "⚡  Live Streams":
             dl(fleet_s, "stream_fleet_alerts")
 
     with tab3:
-        kpi_s = sql(f"""
+        kpi_s, _e_kpi = sql_or_empty(f"""
             SELECT window_start, hub_code, service_code,
                    shipments_in_window, sla_breaches, sla_breach_rate_pct,
                    revenue_in_window, avg_transit_hrs, delivery_rate_pct,
@@ -2443,8 +2872,9 @@ elif page == "⚡  Live Streams":
             ORDER BY window_start DESC, hub_code
             LIMIT 300
         """)
-        if kpi_s.empty:
-            st.info("No streaming KPI data yet. Start the Structured Streaming notebook (13).")
+        if _e_kpi == "missing_table" or kpi_s.empty:
+            _demo_banner()
+            kpi_s = demo_streaming_kpis()
         else:
             kpi_s = tonums(kpi_s, ["shipments_in_window", "sla_breaches", "sla_breach_rate_pct",
                                     "revenue_in_window", "avg_transit_hrs", "delivery_rate_pct"])
@@ -2472,7 +2902,7 @@ elif page == "⚡  Live Streams":
             dl(kpi_s, "stream_realtime_kpis")
 
     with tab4:
-        cross_s = sql(f"""
+        cross_s, _e_cross = sql_or_empty(f"""
             SELECT hub_code, vehicle_id, driver_id, fleet_event_ts,
                    overspeeding, harsh_brake, incident_engine_temp,
                    waybill_number, breach_ts, sla_breach_severity,
@@ -2481,8 +2911,24 @@ elif page == "⚡  Live Streams":
             ORDER BY breach_ts DESC
             LIMIT 200
         """)
-        if cross_s.empty:
-            st.info("No correlated incidents found yet. Cross-stream joins require both streams to have concurrent data.")
+        if _e_cross == "missing_table" or cross_s.empty:
+            _demo_banner()
+            import random as _rd8; _rd8.seed(3)
+            from datetime import datetime as _dt8, timedelta as _td8
+            cross_s = pd.DataFrame([{
+                "hub_code": _rd8.choice(["HUB-RUH","HUB-JED","HUB-DMM"]),
+                "vehicle_id": f"VHC-{_rd8.randint(1000,5999)}",
+                "driver_id": f"DRV-{_rd8.randint(1000,9999)}",
+                "fleet_event_ts": str(_dt8.now()-_td8(minutes=_rd8.randint(5,35))),
+                "overspeeding": _rd8.random()>0.5,
+                "harsh_brake": _rd8.random()>0.4,
+                "incident_engine_temp": round(_rd8.uniform(105,125),1),
+                "waybill_number": f"NQL{_rd8.randint(10**9,10**10-1)}",
+                "breach_ts": str(_dt8.now()-_td8(minutes=_rd8.randint(1,30))),
+                "sla_breach_severity": _rd8.choice(["CRITICAL","HIGH","MEDIUM"]),
+                "time_delta_mins": round(_rd8.uniform(-28,28),1),
+                "total_charge_sar": round(_rd8.uniform(100,2000),2),
+            } for _ in range(30)])
         else:
             cross_s = tonums(cross_s, ["time_delta_mins", "total_charge_sar", "incident_engine_temp"])
             st.markdown("""
